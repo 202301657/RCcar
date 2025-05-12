@@ -1,158 +1,205 @@
-#include "PinChangeInterrupt.h"  // PinChangeInterrupt 라이브러리 임포트
+#include "PinChangeInterrupt.h" // 핀 상태 변화(상승/하강 엣지)를 감지하기 위한 라이브러리로, 외부 인터럽트가 아닌 핀 변경 인터럽트를 지원
+#include <math.h> // 수학 함수(hsv → rgb 변환 등)에 필요한 표준 라이브러리 포함
 
-#define NEUTRAL_THROTTLE 1500     // 기본 스로틀 값 (중립)
-#define pinRC3 A0                 // CH3 입력 (스로틀)
-#define pinRC5 A1                 // CH5 입력 (A 스위치)
-#define pinRC6 A2                 // CH6 입력 (RGB 스위치 - G로 설정됨)
-#define pinLED_PWM 9              // LED 1 (PWM 밝기 조절용)
-#define pinLED_ONOFF 6            // LED 2 (ON/OFF 제어용)
+// 중립 스로틀 값 정의 (RC 수신기의 중간값으로 보통 1500μs)
+#define NEUTRAL_THROTTLE 1500
+
+// RC 수신기 채널에 연결된 아날로그 핀 정의
+#define pinRC1 A2    // CH1: 조이스틱 수평 방향 → RGB 색상 제어 (Hue 값 변화용)
+#define pinRC3 A0    // CH3: 조이스틱 수직 방향 → LED 밝기 조절용
+#define pinRC5 A1    // CH5: 스위치 역할 → LED ON/OFF 기능 제어
+
+// 출력 핀 정의
+#define pinLED_PWM 9         // 밝기 조절을 위한 일반 LED (PWM 핀)
+#define pinLED_ONOFF 6       // LED 시스템 전체 ON/OFF 상태 표시용 디지털 핀
 
 // RGB LED 핀 정의
-#define pinLED_R 3                // 빨간색 LED 핀
-#define pinLED_G 5                // 초록색 LED 핀
-#define pinLED_B 10               // 파란색 LED 핀
+#define pinLED_R 3           // 빨간색 LED PWM 제어
+#define pinLED_G 5           // 초록색 LED PWM 제어
+#define pinLED_B 10          // 파란색 LED PWM 제어
 
-// 변수 정의
-volatile int nRC3PulseWidth = NEUTRAL_THROTTLE;  // CH3 PWM 신호의 길이
-volatile int nRC5PulseWidth = 1000;              // CH5 PWM 신호의 길이 (A 스위치)
-volatile int nRC6PulseWidth = 1000;              // CH6 PWM 신호의 길이 (RGB 스위치)
-volatile unsigned long ulRC3StartHigh = 0;       // CH3 신호 시작 시간
-volatile unsigned long ulRC5StartHigh = 0;       // CH5 신호 시작 시간
-volatile unsigned long ulRC6StartHigh = 0;       // CH6 신호 시작 시간
-volatile boolean bNewRC3Pulse = false;           // CH3 신호 새로 들어옴
-volatile boolean bNewRC5Pulse = false;           // CH5 신호 새로 들어옴
-volatile boolean bNewRC6Pulse = false;           // CH6 신호 새로 들어옴
+// RC 수신기의 각 채널에서 읽은 펄스폭(μs)을 저장할 변수들 (초기값은 중립 상태)
+volatile int nRC1PulseWidth = 1500;
+volatile int nRC3PulseWidth = NEUTRAL_THROTTLE;
+volatile int nRC5PulseWidth = 1000;
 
-int prevRC3PulseWidth = NEUTRAL_THROTTLE;        // 이전 CH3 PWM 값 (변경 여부 체크용)
-bool ledEnabled = false;                         // 전체 LED ON/OFF 상태
-bool rgbLedEnabled = false;                     // RGB LED ON/OFF 상태
+// HIGH 신호가 시작된 시간 기록용 변수들
+volatile unsigned long ulRC1StartHigh = 0;
+volatile unsigned long ulRC3StartHigh = 0;
+volatile unsigned long ulRC5StartHigh = 0;
 
-// 함수 선언
+// 새로운 펄스가 들어왔는지 여부를 표시하는 플래그 변수
+volatile boolean bNewRC1Pulse = false;
+volatile boolean bNewRC3Pulse = false;
+volatile boolean bNewRC5Pulse = false;
+
+// 이전 밝기 값을 저장하여 변화량이 작을 경우 출력하지 않도록 함
+int prevRC3PulseWidth = NEUTRAL_THROTTLE;
+
+// LED 전체 시스템이 현재 켜져 있는지를 나타내는 플래그
+bool ledEnabled = false;
+
+// 각 채널별 인터럽트 핸들러 및 HSV→RGB 변환 함수 선언
+void pwmRC1();
 void pwmRC3();
 void pwmRC5();
-void pwmRC6();
+void hsvToRgb(float h, float s, float v, int& r, int& g, int& b);
 
 void setup() {
-  pinMode(pinRC3, INPUT_PULLUP);                 // CH3 핀을 입력으로 설정 (풀업 저항 사용)
-  pinMode(pinRC5, INPUT_PULLUP);                 // CH5 핀을 입력으로 설정 (풀업 저항 사용)
-  pinMode(pinRC6, INPUT_PULLUP);                 // CH6 핀을 입력으로 설정 (풀업 저항 사용)
-  
-  // 핀 변화 인터럽트 설정
-  attachPCINT(digitalPinToPCINT(pinRC3), pwmRC3, CHANGE);  // CH3에서 변화가 있을 때 pwmRC3 함수 호출
-  attachPCINT(digitalPinToPCINT(pinRC5), pwmRC5, CHANGE);  // CH5에서 변화가 있을 때 pwmRC5 함수 호출
-  attachPCINT(digitalPinToPCINT(pinRC6), pwmRC6, CHANGE);  // CH6에서 변화가 있을 때 pwmRC6 함수 호출
+  // RC 채널 입력핀을 풀업 저항을 사용하여 설정
+  pinMode(pinRC1, INPUT_PULLUP);
+  pinMode(pinRC3, INPUT_PULLUP);
+  pinMode(pinRC5, INPUT_PULLUP);
 
-  pinMode(pinLED_PWM, OUTPUT);                  // PWM LED 핀을 출력으로 설정
-  pinMode(pinLED_ONOFF, OUTPUT);                // ON/OFF LED 핀을 출력으로 설정
-  
-  // RGB LED 핀을 출력으로 설정
-  pinMode(pinLED_R, OUTPUT);                    
-  pinMode(pinLED_G, OUTPUT);                    
-  pinMode(pinLED_B, OUTPUT);                    
+  // 핀 변경 인터럽트를 등록하여 상승/하강 엣지 모두 감지하도록 설정
+  attachPCINT(digitalPinToPCINT(pinRC1), pwmRC1, CHANGE);
+  attachPCINT(digitalPinToPCINT(pinRC3), pwmRC3, CHANGE);
+  attachPCINT(digitalPinToPCINT(pinRC5), pwmRC5, CHANGE);
 
-  // 초기 상태로 LED 끄기
-  analogWrite(pinLED_PWM, 0);                   // PWM LED 끄기
-  digitalWrite(pinLED_ONOFF, LOW);              // ON/OFF LED 끄기
-  digitalWrite(pinLED_R, LOW);                  // 빨강 LED 끄기
-  digitalWrite(pinLED_G, LOW);                  // 초록 LED 끄기
-  digitalWrite(pinLED_B, LOW);                  // 파랑 LED 끄기
+  // LED 관련 핀을 출력으로 설정
+  pinMode(pinLED_PWM, OUTPUT);
+  pinMode(pinLED_ONOFF, OUTPUT);
+  pinMode(pinLED_R, OUTPUT);
+  pinMode(pinLED_G, OUTPUT);
+  pinMode(pinLED_B, OUTPUT);
 
-  Serial.begin(9600);                           // 시리얼 통신 시작
-  Serial.println("CH3: Brightness | CH5(A Switch): ON/OFF Control | CH6(RGB Switch): Color Change");
-}
+  // 초기값으로 모든 LED 꺼짐 상태로 설정
+  analogWrite(pinLED_PWM, 0);          // 밝기 0
+  digitalWrite(pinLED_ONOFF, LOW);     // ON/OFF 표시 LED 꺼짐
+  digitalWrite(pinLED_R, LOW);
+  digitalWrite(pinLED_G, LOW);
+  digitalWrite(pinLED_B, LOW);
 
-void pwmRC3() {
-  if (digitalRead(pinRC3) == HIGH) {            // CH3 핀이 HIGH일 경우
-    ulRC3StartHigh = micros();                  // 신호의 시작 시간 기록
-  } else {                                      // CH3 핀이 LOW일 경우
-    if (ulRC3StartHigh && !bNewRC3Pulse) {      // 시작 시간이 기록되고 새로운 펄스가 아닐 경우
-      nRC3PulseWidth = (int)(micros() - ulRC3StartHigh); // 펄스 길이 계산
-      ulRC3StartHigh = 0;                       // 시작 시간 초기화
-      bNewRC3Pulse = true;                      // 새로운 펄스 있음
-    }
-  }
-}
-
-void pwmRC5() {
-  if (digitalRead(pinRC5) == HIGH) {            // CH5 핀이 HIGH일 경우
-    ulRC5StartHigh = micros();                  // 신호의 시작 시간 기록
-  } else {                                      // CH5 핀이 LOW일 경우
-    if (ulRC5StartHigh && !bNewRC5Pulse) {      // 시작 시간이 기록되고 새로운 펄스가 아닐 경우
-      nRC5PulseWidth = (int)(micros() - ulRC5StartHigh); // 펄스 길이 계산
-      ulRC5StartHigh = 0;                       // 시작 시간 초기화
-      bNewRC5Pulse = true;                      // 새로운 펄스 있음
-    }
-  }
-}
-
-void pwmRC6() {
-  if (digitalRead(pinRC6) == HIGH) {            // CH6 핀이 HIGH일 경우
-    ulRC6StartHigh = micros();                  // 신호의 시작 시간 기록
-  } else {                                      // CH6 핀이 LOW일 경우
-    if (ulRC6StartHigh && !bNewRC6Pulse) {      // 시작 시간이 기록되고 새로운 펄스가 아닐 경우
-      nRC6PulseWidth = (int)(micros() - ulRC6StartHigh); // 펄스 길이 계산
-      ulRC6StartHigh = 0;                       // 시작 시간 초기화
-      bNewRC6Pulse = true;                      // 새로운 펄스 있음
-    }
-  }
+  // 시리얼 통신 시작 (모니터링용)
+  Serial.begin(9600);
+  Serial.println("CH1(A2): RGB 색상 | CH3(A0): 밝기 | CH5(A1): LED ON/OFF");
 }
 
 void loop() {
-  // A 스위치(ON/OFF)
-  if (bNewRC5Pulse) {                           // CH5 신호가 새로 들어왔을 때
-    if (nRC5PulseWidth > 1500) {                // PWM 값이 1500보다 크면
-      ledEnabled = true;                        // 전체 LED ON
-      rgbLedEnabled = true;                     // RGB LED도 켬
-      digitalWrite(pinLED_ONOFF, HIGH);         // ON/OFF LED 켬
-      Serial.println("CH5 A Switch: ON → LEDs ENABLED");
-    } else {                                    // PWM 값이 1500 이하이면
-      ledEnabled = false;                       // 전체 LED OFF
-      rgbLedEnabled = false;                    // RGB LED 끔
-      digitalWrite(pinLED_ONOFF, LOW);          // ON/OFF LED 끔
-      analogWrite(pinLED_PWM, 0);               // PWM LED 끄기
-      digitalWrite(pinLED_R, LOW);              // 빨강 LED 끄기
-      digitalWrite(pinLED_G, LOW);              // 초록 LED 끄기
-      digitalWrite(pinLED_B, LOW);              // 파랑 LED 끄기
+  // CH5 스위치 상태가 변경되었을 때 실행
+  if (bNewRC5Pulse) {
+    if (nRC5PulseWidth > 1500) {  // 스위치가 ON 위치일 경우
+      ledEnabled = true;
+      digitalWrite(pinLED_ONOFF, HIGH);  // ON/OFF 상태 표시 LED 켜기
+
+      // 밝기 복원: RC3의 현재 값을 사용하여 LED 밝기를 설정
+      int brightness = map(nRC3PulseWidth, 1000, 2000, 255, 0);
+      brightness = constrain(brightness, 0, 255);
+      analogWrite(pinLED_PWM, brightness);
+
+      Serial.println("CH5 A Switch: ON → LEDs ENABLED (Brightness Restored)");
+    } else {
+      // 스위치가 OFF일 경우: 모든 LED 끄기
+      ledEnabled = false;
+      digitalWrite(pinLED_ONOFF, LOW);
+      analogWrite(pinLED_PWM, 0);
+      digitalWrite(pinLED_R, LOW);
+      digitalWrite(pinLED_G, LOW);
+      digitalWrite(pinLED_B, LOW);
     }
-    bNewRC5Pulse = false;                       // CH5 신호 처리 완료
+    bNewRC5Pulse = false; // 플래그 초기화
   }
 
-  // RGB LED 스위치 (CH6)
-  if (rgbLedEnabled && bNewRC6Pulse) {          // RGB LED가 활성화되고 CH6 신호가 새로 들어왔을 때
-    if (nRC6PulseWidth < 1200) {                // PWM 값이 1200 미만이면
-      digitalWrite(pinLED_R, HIGH);             // 빨강 LED 켬
-      digitalWrite(pinLED_G, LOW);              // 초록 LED 끔
-      digitalWrite(pinLED_B, LOW);              // 파랑 LED 끔
-      Serial.println("RGB LED: RED");
-    } else if (nRC6PulseWidth > 1800) {         // PWM 값이 1800 이상이면
-      digitalWrite(pinLED_R, LOW);              // 빨강 LED 끔
-      digitalWrite(pinLED_G, LOW);              // 초록 LED 끔
-      digitalWrite(pinLED_B, HIGH);             // 파랑 LED 켬
-      Serial.println("RGB LED: BLUE");
-    } else {                                    // PWM 값이 1200과 1800 사이이면
-      digitalWrite(pinLED_R, LOW);              // 빨강 LED 끔
-      digitalWrite(pinLED_G, HIGH);             // 초록 LED 켬
-      digitalWrite(pinLED_B, LOW);              // 파랑 LED 끔
-      Serial.println("RGB LED: GREEN");
-    }
-    bNewRC6Pulse = false;                       // CH6 신호 처리 완료
-  }
+  // CH3 밝기 조정 (조이스틱 위/아래)
+  if (ledEnabled && bNewRC3Pulse) {
+    if (abs(prevRC3PulseWidth - nRC3PulseWidth) > 10) { // 변화가 일정 수준 이상일 경우만 적용
+      int brightness = map(nRC3PulseWidth, 1000, 2000, 255, 0); // RC 값 → 밝기로 매핑
+      brightness = constrain(brightness, 0, 255); // 0~255 범위로 제한
+      analogWrite(pinLED_PWM, brightness); // 밝기 적용
 
-  // 스위치 ON 상태일 때만 밝기 반영
-  if (ledEnabled && bNewRC3Pulse) {             // LED가 켜져 있고 CH3 신호가 새로 들어왔을 때
-    if (abs(prevRC3PulseWidth - nRC3PulseWidth) > 10) {  // 이전과 현재 PWM 값 차이가 10 이상일 때만 처리
-      int brightness = map(nRC3PulseWidth, 1000, 2000, 255, 0); // PWM 값을 밝기로 매핑
-      brightness = constrain(brightness, 0, 255);              // 밝기 범위 제한
-
-      analogWrite(pinLED_PWM, brightness);      // PWM LED 밝기 조정
-
-      Serial.print("CH3 PWM: ");                // Serial에 CH3 PWM: ____ PWM값 출력
-      Serial.print(nRC3PulseWidth);
-      Serial.print(" → Brightness: ");          // Serial에 -> Brightness: ____ 밝기값 출력
+      Serial.print("CH3 Brightness: ");
       Serial.println(brightness);
 
-      prevRC3PulseWidth = nRC3PulseWidth;     // 이전 PWM 값 업데이트
+      prevRC3PulseWidth = nRC3PulseWidth;
     }
-    bNewRC3Pulse = false;                      // CH3 신호 처리 완료
+    bNewRC3Pulse = false;
   }
+
+  // CH1 색상 제어 (조이스틱 좌/우)
+  if (ledEnabled && bNewRC1Pulse) {
+    float hue = map(nRC1PulseWidth, 1000, 2000, 0, 360); // RC 신호 → Hue 값으로 변환
+    int r, g, b;
+    hsvToRgb(hue, 1.0, 1.0, r, g, b); // HSV → RGB 변환
+
+    // RGB 핀에 색상 적용 (밝기는 항상 100%)
+    analogWrite(pinLED_R, r);
+    analogWrite(pinLED_G, g);
+    analogWrite(pinLED_B, b);
+
+    Serial.print("CH1 Hue: ");
+    Serial.print(hue);
+    Serial.print(" → RGB(");
+    Serial.print(r); Serial.print(", ");
+    Serial.print(g); Serial.print(", ");
+    Serial.print(b); Serial.println(")");
+    
+    bNewRC1Pulse = false;
+  }
+}
+
+// CH1 핀에서 펄스폭 측정
+void pwmRC1() {
+  if (digitalRead(pinRC1) == HIGH) {
+    ulRC1StartHigh = micros(); // 상승 엣지: 시작 시간 기록
+  } else {
+    if (ulRC1StartHigh && !bNewRC1Pulse) {
+      nRC1PulseWidth = (int)(micros() - ulRC1StartHigh); // 펄스폭 계산
+      ulRC1StartHigh = 0;
+      bNewRC1Pulse = true; // 새로운 값 수신 표시
+    }
+  }
+}
+
+// CH3 핀에서 펄스폭 측정 (밝기 제어용)
+void pwmRC3() {
+  if (digitalRead(pinRC3) == HIGH) {
+    ulRC3StartHigh = micros(); // 상승 엣지: 시작 시간 기록
+  } else {
+    if (ulRC3StartHigh && !bNewRC3Pulse) {
+      nRC3PulseWidth = (int)(micros() - ulRC3StartHigh);
+      ulRC3StartHigh = 0;
+      bNewRC3Pulse = true;
+    }
+  }
+}
+
+// CH5 핀에서 펄스폭 측정 (ON/OFF 스위치용)
+void pwmRC5() {
+  if (digitalRead(pinRC5) == HIGH) {
+    ulRC5StartHigh = micros(); // 상승 엣지
+  } else {
+    if (ulRC5StartHigh && !bNewRC5Pulse) {
+      nRC5PulseWidth = (int)(micros() - ulRC5StartHigh);
+      ulRC5StartHigh = 0;
+      bNewRC5Pulse = true;
+    }
+  }
+}
+
+// HSV 색상 모델 값을 RGB 모델 값으로 변환
+void hsvToRgb(float h, float s, float v, int& r, int& g, int& b) {
+  float c = v * s; // 채도 및 밝기에 따른 색상 강도
+  float x = c * (1 - fabs(fmod(h / 60.0, 2) - 1)); // 색상 구간 내 보정 값
+  float m = v - c; // 밝기 보정 값
+  float r1, g1, b1;
+
+  // HSV 색상 범위에 따라 RGB 비율 설정
+  if (h < 60) {
+    r1 = c; g1 = x; b1 = 0;
+  } else if (h < 120) {
+    r1 = x; g1 = c; b1 = 0;
+  } else if (h < 180) {
+    r1 = 0; g1 = c; b1 = x;
+  } else if (h < 240) {
+    r1 = 0; g1 = x; b1 = c;
+  } else if (h < 300) {
+    r1 = x; g1 = 0; b1 = c;
+  } else {
+    r1 = c; g1 = 0; b1 = x;
+  }
+
+  // 0~1 범위의 RGB 값 → 0~255로 변환
+  r = (r1 + m) * 255;
+  g = (g1 + m) * 255;
+  b = (b1 + m) * 255;
 }
